@@ -1,0 +1,869 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes">
+    <title>Pluviômetro Pro | Gestão de Chuvas</title>
+    <meta name="theme-color" content="#2e7d32">
+
+    <!-- PWA: Apple -->
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <meta name="apple-mobile-web-app-title" content="Pluviômetro">
+
+    <!-- PWA: Manifest inline via blob -->
+    <script>
+    (function() {
+        const manifest = {
+            name: "Pluviômetro Pro",
+            short_name: "Pluviômetro",
+            description: "Monitoramento Agrícola de Chuvas",
+            start_url: "./",
+            display: "standalone",
+            background_color: "#0a1a0a",
+            theme_color: "#2e7d32",
+            orientation: "portrait",
+            icons: [
+                {
+                    src: "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 192 192'%3E%3Crect width='192' height='192' rx='32' fill='%232e7d32'/%3E%3Ctext x='96' y='130' font-size='100' text-anchor='middle'%3E%F0%9F%8C%A6%EF%B8%8F%3C/text%3E%3C/svg%3E",
+                    sizes: "192x192",
+                    type: "image/svg+xml",
+                    purpose: "any maskable"
+                },
+                {
+                    src: "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 512 512'%3E%3Crect width='512' height='512' rx='80' fill='%232e7d32'/%3E%3Ctext x='256' y='340' font-size='260' text-anchor='middle'%3E%F0%9F%8C%A6%EF%B8%8F%3C/text%3E%3C/svg%3E",
+                    sizes: "512x512",
+                    type: "image/svg+xml",
+                    purpose: "any maskable"
+                }
+            ]
+        };
+        const blob = new Blob([JSON.stringify(manifest)], {type: 'application/json'});
+        const url  = URL.createObjectURL(blob);
+        const link = document.createElement('link');
+        link.rel  = 'manifest';
+        link.href = url;
+        document.head.appendChild(link);
+    })();
+
+    // Service Worker inline via blob
+    if ('serviceWorker' in navigator) {
+        const swCode = `
+const CACHE = 'pluviometro-v1';
+const ASSETS = ['./', './index.html'];
+
+self.addEventListener('install', e => {
+    e.waitUntil(
+        caches.open(CACHE).then(c => c.addAll(ASSETS)).then(() => self.skipWaiting())
+    );
+});
+
+self.addEventListener('activate', e => {
+    e.waitUntil(
+        caches.keys().then(keys =>
+            Promise.all(keys.filter(k => k !== CACHE).map(k => caches.delete(k)))
+        ).then(() => self.clients.claim())
+    );
+});
+
+self.addEventListener('fetch', e => {
+    // Deixa Firebase/CDN passar direto, só cacheia o próprio app
+    if (!e.request.url.startsWith(self.location.origin)) return;
+    e.respondWith(
+        caches.match(e.request).then(cached => cached || fetch(e.request))
+    );
+});
+        `;
+        const swBlob = new Blob([swCode], {type: 'application/javascript'});
+        const swUrl  = URL.createObjectURL(swBlob);
+        window.addEventListener('load', () => {
+            navigator.serviceWorker.register(swUrl)
+                .then(() => console.log('SW registrado'))
+                .catch(err => console.warn('SW erro:', err));
+        });
+    }
+    </script>
+
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-datalabels@2.2.0"></script>
+
+    <!-- Firebase SDK -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import {
+            getFirestore, collection, getDocs, addDoc, deleteDoc,
+            doc, setDoc, getDoc
+        } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+        import {
+            getAuth, createUserWithEmailAndPassword, signInWithEmailAndPassword,
+            signOut, onAuthStateChanged, sendPasswordResetEmail
+        } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+
+        const firebaseConfig = {
+            apiKey: "AIzaSyAb0cYU8TDVuzlzh5t2m-VhcMhBGgNNpc4",
+            authDomain: "clima-259a3.firebaseapp.com",
+            projectId: "clima-259a3",
+            storageBucket: "clima-259a3.firebasestorage.app",
+            messagingSenderId: "40365847619",
+            appId: "1:40365847619:web:3f34b8530f6dc37457d0f6",
+            measurementId: "G-3WQ9GK5FVY"
+        };
+
+        const app  = initializeApp(firebaseConfig);
+        const db   = getFirestore(app);
+        const auth = getAuth(app);
+
+        // ─── CACHE LOCAL ──────────────────────────────────────────
+        let _cache = null;
+        let _nomes = { fazenda1: 'Fazenda 1', fazenda2: 'Fazenda 2' };
+        let _uid   = null;
+
+        // Caminho base do usuário logado
+        const userCol  = col  => collection(db, `users/${_uid}/${col}`);
+        const userDoc  = (col, id) => doc(db, `users/${_uid}/${col}`, id);
+
+        // ─── FIRESTORE: registros (por usuário) ───────────────────
+        async function fsGetRegistros() {
+            const snap = await getDocs(userCol('registros'));
+            _cache = snap.docs.map(d => ({ _docId: d.id, ...d.data() }));
+            return _cache;
+        }
+        async function fsAddRegistro(reg) {
+            const ref = await addDoc(userCol('registros'), reg);
+            const novo = { _docId: ref.id, ...reg };
+            if (_cache) _cache.push(novo);
+            return novo;
+        }
+        async function fsDeleteRegistro(docId) {
+            await deleteDoc(userDoc('registros', docId));
+            if (_cache) _cache = _cache.filter(r => r._docId !== docId);
+        }
+
+        // ─── FIRESTORE: nomes das fazendas (por usuário) ──────────
+        async function fsGetNomes() {
+            const snap = await getDoc(userDoc('config', 'nomes'));
+            if (snap.exists()) _nomes = snap.data();
+            return _nomes;
+        }
+        async function fsSetNomes(nomes) {
+            _nomes = nomes;
+            await setDoc(userDoc('config', 'nomes'), nomes);
+        }
+
+        // ─── AUTH ─────────────────────────────────────────────────
+        async function authCadastrar(email, senha) {
+            return createUserWithEmailAndPassword(auth, email, senha);
+        }
+        async function authEntrar(email, senha) {
+            return signInWithEmailAndPassword(auth, email, senha);
+        }
+        async function authSair() {
+            _cache = null;
+            _nomes = { fazenda1: 'Fazenda 1', fazenda2: 'Fazenda 2' };
+            _uid   = null;
+            return signOut(auth);
+        }
+        async function authResetSenha(email) {
+            return sendPasswordResetEmail(auth, email);
+        }
+
+        // ─── EXPOR para escopo global ─────────────────────────────
+        window.FS = { fsGetRegistros, fsAddRegistro, fsDeleteRegistro, fsGetNomes, fsSetNomes };
+        window.AUTH = { authCadastrar, authEntrar, authSair, authResetSenha };
+        window._nomesCache     = () => _nomes;
+        window._registrosCache = () => _cache || [];
+
+        // ─── OBSERVADOR DE AUTENTICAÇÃO ───────────────────────────
+        onAuthStateChanged(auth, async (user) => {
+            if (user) {
+                _uid = user.uid;
+                mostrarApp(user.email);
+                showStatus('⏳ Carregando seus dados...', 'info', 99999);
+                try {
+                    await fsGetNomes();
+                    await fsGetRegistros();
+                    document.getElementById('dataChuva').valueAsDate = new Date();
+                    povoarAnos();
+                    carregarNomes();
+                    atualizarUI();
+                    showStatus('✅ Dados carregados!', 'ok');
+                } catch(e) {
+                    showStatus('❌ Erro ao carregar: ' + e.message, 'err', 8000);
+                    console.error(e);
+                }
+            } else {
+                mostrarLogin();
+            }
+        });
+    </script>
+
+    <style>
+        * { box-sizing: border-box; }
+        :root { --primary: #2e7d32; --accent: #66bb6a; --dark: #0a1a0a; --card: #152a15; --text: #e0e0e0; }
+        body { font-family: 'Segoe UI', Roboto, system-ui, sans-serif; background: #0a1a0a; color: var(--text); margin: 0; padding-bottom: 20px; }
+
+        /* ── TELA DE LOGIN ── */
+        #telaLogin {
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+        }
+        .login-box {
+            background: var(--card);
+            border: 1px solid rgba(255,255,255,0.1);
+            border-radius: 24px;
+            padding: 32px 24px;
+            width: 100%;
+            max-width: 380px;
+        }
+        .login-logo {
+            text-align: center;
+            margin-bottom: 24px;
+        }
+        .login-logo h1 { font-size: 22px; color: #fff; margin: 8px 0 2px; letter-spacing: 1px; }
+        .login-logo p  { font-size: 11px; color: #66bb6a88; margin: 0; }
+        .login-tabs {
+            display: flex;
+            background: #0c1a0c;
+            border-radius: 40px;
+            padding: 4px;
+            margin-bottom: 22px;
+        }
+        .login-tab {
+            flex: 1;
+            padding: 10px;
+            border: none;
+            border-radius: 36px;
+            background: transparent;
+            color: #aaa;
+            font-weight: bold;
+            font-size: 13px;
+            cursor: pointer;
+            transition: 0.25s;
+        }
+        .login-tab.active { background: var(--primary); color: #fff; }
+        .login-field {
+            margin-bottom: 14px;
+        }
+        .login-field label {
+            display: block;
+            font-size: 10px;
+            font-weight: bold;
+            color: var(--accent);
+            margin-bottom: 6px;
+            letter-spacing: 0.8px;
+            text-transform: uppercase;
+        }
+        .login-field input {
+            width: 100%;
+            background: #0c1a0c;
+            border: 1px solid #2a4b2a;
+            border-radius: 14px;
+            color: #fff;
+            padding: 14px;
+            font-size: 15px;
+        }
+        .login-field input:focus { outline: none; border-color: var(--accent); }
+        .btn-login {
+            width: 100%;
+            background: linear-gradient(95deg, var(--primary), #3c9e40);
+            color: #fff;
+            font-weight: bold;
+            font-size: 15px;
+            padding: 16px;
+            border: none;
+            border-radius: 40px;
+            cursor: pointer;
+            margin-top: 6px;
+            transition: opacity 0.2s;
+        }
+        .btn-login:disabled { opacity: 0.5; cursor: not-allowed; }
+        .login-link {
+            text-align: center;
+            margin-top: 14px;
+            font-size: 12px;
+            color: #666;
+        }
+        .login-link span {
+            color: var(--accent);
+            cursor: pointer;
+            text-decoration: underline;
+        }
+        .login-err {
+            background: #3a0000;
+            border: 1px solid #7f0000;
+            color: #ffaaaa;
+            font-size: 12px;
+            padding: 10px 14px;
+            border-radius: 10px;
+            margin-bottom: 14px;
+            display: none;
+        }
+
+        /* ── HEADER / APP ── */
+        #telaApp { display: none; }
+        header { padding: 14px 16px; text-align: center; background: rgba(0,0,0,0.8); border-bottom: 3px solid var(--primary); box-shadow: 0 4px 10px rgba(0,0,0,0.4); }
+        header h2 { margin: 0 0 4px; font-size: 17px; letter-spacing: 1.5px; color: #fff; text-transform: uppercase; }
+        .user-bar {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 10px;
+            font-size: 11px;
+            color: #88aa88;
+            margin-top: 4px;
+        }
+        .btn-logout {
+            background: #2a1a1a;
+            border: 1px solid #5a2a2a;
+            color: #ffaaaa;
+            font-size: 10px;
+            font-weight: bold;
+            padding: 4px 10px;
+            border-radius: 20px;
+            cursor: pointer;
+        }
+        .firebase-badge { display: inline-flex; align-items: center; gap: 5px; font-size: 10px; color: #f5820055; }
+        .firebase-badge svg { width: 11px; height: 11px; fill: #f5820055; }
+
+        /* ── APP ── */
+        .container { max-width: 700px; margin: 0 auto; padding: 12px; }
+        .card { background: var(--card); padding: 18px 16px; border-radius: 20px; margin-bottom: 18px; border: 1px solid rgba(255,255,255,0.1); }
+        h3 { color: var(--accent); margin-top: 0; font-size: 14px; text-transform: uppercase; letter-spacing: 1px; }
+        .nome-fazenda-group { display: flex; gap: 10px; margin-bottom: 16px; }
+        .nome-fazenda-group div { flex: 1; background: #0c1a0c; padding: 8px 12px; border-radius: 12px; }
+        .nome-fazenda-group label { font-size: 10px; font-weight: bold; color: var(--accent); display: block; margin-bottom: 4px; }
+        .nome-fazenda-group input { background: transparent; border: none; border-bottom: 1px solid #3a5a3a; color: white; width: 100%; padding: 4px 0; font-size: 14px; }
+        .farm-selector { display: flex; gap: 8px; margin-bottom: 20px; }
+        .farm-btn { flex: 1; background: #1f3a1f; border: none; padding: 12px; border-radius: 40px; color: #aaa; font-weight: bold; cursor: pointer; font-size: 13px; transition: 0.3s; }
+        .farm-btn.active { background: var(--primary); color: white; box-shadow: 0 0 12px rgba(102,187,106,0.4); }
+        .input-group { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 12px; }
+        input[type="date"], input[type="number"] { background: #0c1a0c; color: white; border: 1px solid #2a4b2a; padding: 14px; border-radius: 14px; font-size: 16px; width: 100%; }
+        button.btn-main { background: linear-gradient(95deg, var(--primary), #3c9e40); color: white; font-weight: bold; padding: 16px; border: none; border-radius: 40px; width: 100%; cursor: pointer; font-size: 16px; margin-bottom: 12px; }
+        button.btn-main:disabled { opacity: 0.5; cursor: not-allowed; }
+        .stats-row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 18px; }
+        .stat-box { background: rgba(0,0,0,0.4); padding: 14px; border-radius: 16px; text-align: center; border: 1px solid #2a4b2a; }
+        .stat-box small { font-size: 10px; color: #aaccaa; text-transform: uppercase; }
+        .stat-box b { display: block; font-size: 22px; color: var(--accent); margin-top: 5px; }
+        .btn-group { display: flex; gap: 8px; }
+        .btn-group button { flex: 1; padding: 12px; border: none; border-radius: 12px; color: white; font-size: 11px; font-weight: bold; cursor: pointer; }
+        #statusBar { position: fixed; bottom: 0; left: 0; right: 0; padding: 10px 16px; font-size: 13px; font-weight: bold; text-align: center; z-index: 999; transform: translateY(100%); transition: transform 0.3s; }
+        #statusBar.show { transform: translateY(0); }
+        #statusBar.ok   { background: #1b5e20; color: #a5d6a7; }
+        #statusBar.err  { background: #7f0000; color: #ffcdd2; }
+        #statusBar.info { background: #1a3a5a; color: #b3e4ff; }
+        canvas { max-height: 240px; width: 100%; margin-top: 10px; }
+        footer { text-align: center; font-size: 10px; opacity: 0.4; margin-top: 20px; padding-bottom: 10px; }
+        .registros-lista { margin-top: 10px; max-height: 220px; overflow-y: auto; }
+        .reg-item { display: flex; justify-content: space-between; align-items: center; padding: 8px 12px; border-radius: 10px; margin-bottom: 6px; background: rgba(0,0,0,0.3); font-size: 13px; }
+        .reg-data { color: #aaa; }
+        .reg-val  { color: var(--accent); font-weight: bold; }
+        .del-btn  { background: #6d1e1e; border: none; color: #ffaaaa; border-radius: 8px; padding: 4px 10px; cursor: pointer; font-size: 11px; }
+        .loading-spinner { display: inline-block; width: 14px; height: 14px; border: 2px solid #66bb6a55; border-top-color: #66bb6a; border-radius: 50%; animation: spin 0.7s linear infinite; vertical-align: middle; margin-right: 6px; }
+        @keyframes spin { to { transform: rotate(360deg); } }
+    </style>
+</head>
+<body>
+
+<div id="statusBar"></div>
+
+<!-- ════════════════════════════════════════════════
+     TELA DE LOGIN / CADASTRO
+════════════════════════════════════════════════ -->
+<div id="telaLogin">
+    <div class="login-box">
+        <div class="login-logo">
+            <div style="font-size:38px;">🌦️</div>
+            <h1>PLUVIÔMETRO PRO</h1>
+            <p>Monitoramento Agrícola de Chuvas</p>
+        </div>
+
+        <div class="login-tabs">
+            <button class="login-tab active" id="tabEntrar"   onclick="trocarTab('entrar')">Entrar</button>
+            <button class="login-tab"        id="tabCadastro" onclick="trocarTab('cadastro')">Cadastrar</button>
+        </div>
+
+        <div id="loginErr" class="login-err"></div>
+
+        <div class="login-field">
+            <label>E-mail</label>
+            <input type="email" id="loginEmail" placeholder="seu@email.com" autocomplete="email">
+        </div>
+        <div class="login-field" id="campoNome" style="display:none">
+            <label>Seu nome</label>
+            <input type="text" id="loginNome" placeholder="Como quer ser chamado?">
+        </div>
+        <div class="login-field">
+            <label>Senha</label>
+            <input type="password" id="loginSenha" placeholder="••••••••" autocomplete="current-password">
+        </div>
+        <div class="login-field" id="campoConfirma" style="display:none">
+            <label>Confirmar senha</label>
+            <input type="password" id="loginConfirma" placeholder="••••••••" autocomplete="new-password">
+        </div>
+
+        <button class="btn-login" id="btnAcao" onclick="acaoLogin()">Entrar</button>
+
+        <div class="login-link" id="linkReset">
+            Esqueceu a senha? <span onclick="resetSenha()">Recuperar por e-mail</span>
+        </div>
+    </div>
+</div>
+
+<!-- ════════════════════════════════════════════════
+     APP PRINCIPAL
+════════════════════════════════════════════════ -->
+<div id="telaApp">
+    <header>
+        <h2>🌦️ MONITORAMENTO AGRÍCOLA</h2>
+        <div class="user-bar">
+            <div class="firebase-badge">
+                <svg viewBox="0 0 24 24"><path d="M3.89 15.672L6.255.461A.308.308 0 016.81.3l2.515 4.922 2.117-4.043a.314.314 0 01.554 0l3.17 6.055L19.55 3.6a.315.315 0 01.491.333l-3.96 18.04a.315.315 0 01-.306.248H8.226a.32.32 0 01-.307-.238L3.89 15.672z"/></svg>
+                Firebase
+            </div>
+            <span id="emailLogado" style="color:#66bb6a88; font-size:11px;"></span>
+            <button class="btn-logout" onclick="fazerLogout()">⏻ Sair</button>
+        </div>
+    </header>
+
+    <div class="container">
+        <div class="card">
+            <h3>⚙️ Configurar Unidades</h3>
+            <div class="nome-fazenda-group">
+                <div><label>NOME DA UNIDADE 1</label><input type="text" id="nomeFazenda1" placeholder="Fazenda 1"></div>
+                <div><label>NOME DA UNIDADE 2</label><input type="text" id="nomeFazenda2" placeholder="Fazenda 2"></div>
+            </div>
+            <div class="farm-selector">
+                <button class="farm-btn active" id="btnFarm1" onclick="mudarFazenda('fazenda1')">Fazenda 1</button>
+                <button class="farm-btn"        id="btnFarm2" onclick="mudarFazenda('fazenda2')">Fazenda 2</button>
+            </div>
+            <div class="input-group">
+                <input type="date"   id="dataChuva">
+                <input type="number" id="valorChuva" placeholder="Chuva em mm" step="0.1" min="0">
+            </div>
+            <button class="btn-main" id="btnSalvar" onclick="lancar()">💾 SALVAR REGISTRO</button>
+            <div class="btn-group">
+                <button style="background:#1e5a8a;" onclick="exportarDados()">📥 EXPORTAR</button>
+                <button style="background:#2e6b2e;" onclick="document.getElementById('fileIn').click()">📤 IMPORTAR</button>
+                <button style="background:#9e3a2c;" onclick="limparTudo()">🗑️ LIMPAR TUDO</button>
+            </div>
+            <input type="file" id="fileIn" style="display:none" accept=".json" onchange="importarDados(this.files[0])">
+        </div>
+
+        <div class="card">
+            <h3>📋 Registros Recentes — <span id="labelUnidade">Fazenda 1</span></h3>
+            <div class="registros-lista" id="registrosLista">
+                <p style="color:#555; font-size:13px; text-align:center; margin:20px 0;">Carregando...</p>
+            </div>
+        </div>
+
+        <div class="card">
+            <h3>📈 Evolução Diária (Mês Atual)</h3>
+            <div class="stats-row">
+                <div class="stat-box"><small>Total Acumulado</small><b id="totalMes">0 mm</b></div>
+                <div class="stat-box"><small>Maior Evento</small><b id="picoMes">0 mm</b></div>
+            </div>
+            <canvas id="chartDiario"></canvas>
+        </div>
+
+        <div class="card">
+            <h3>📅 Acumulado por Mês</h3>
+            <div class="stats-row">
+                <div class="stat-box"><small>🌂 Menor Chuva</small><b id="menorMesNome" style="font-size:15px;color:#64b5f6;">—</b><b id="menorMesVal" style="font-size:18px;color:#64b5f6;">0 mm</b></div>
+                <div class="stat-box"><small>🌊 Maior Chuva</small><b id="maiorMesNome" style="font-size:15px;color:#ff7043;">—</b><b id="maiorMesVal" style="font-size:18px;color:#ff7043;">0 mm</b></div>
+            </div>
+            <div class="stats-row">
+                <div class="stat-box"><small>📆 Dias com Chuva</small><b id="diasChuva" style="color:#ffd54f;">0</b></div>
+                <div class="stat-box"><small>📊 Média Diária</small><b id="mediaDiaria" style="color:#ce93d8;">0 mm</b></div>
+            </div>
+            <canvas id="chartMensal"></canvas>
+        </div>
+
+        <div class="card">
+            <h3>📊 Comparativo entre Áreas</h3>
+            <select id="anoSelect" onchange="atualizarUI()" style="width:100%; background:#0c1a0c; color:white; padding:10px; border:1px solid #2a4b2a; border-radius:12px; margin-bottom:15px;"></select>
+            <canvas id="chartComp"></canvas>
+        </div>
+
+        <footer>João Divino Barbosa © 2026</footer>
+    </div>
+</div>
+
+<script>
+Chart.register(ChartDataLabels);
+
+// ─── ESTADO ──────────────────────────────────────────────────
+let currentFarm = 'fazenda1';
+let charts = {};
+let modoLogin = 'entrar'; // 'entrar' | 'cadastro'
+
+// ─── STATUS ──────────────────────────────────────────────────
+function showStatus(msg, tipo = 'ok', ms = 3000) {
+    const bar = document.getElementById('statusBar');
+    bar.textContent = msg;
+    bar.className = `show ${tipo}`;
+    clearTimeout(bar._t);
+    if (ms < 99999) bar._t = setTimeout(() => bar.className = '', ms);
+}
+
+// ─── TELAS ───────────────────────────────────────────────────
+function mostrarLogin() {
+    document.getElementById('telaLogin').style.display = 'flex';
+    document.getElementById('telaApp').style.display   = 'none';
+}
+function mostrarApp(email) {
+    document.getElementById('telaLogin').style.display = 'none';
+    document.getElementById('telaApp').style.display   = 'block';
+    document.getElementById('emailLogado').textContent = email;
+}
+
+// ─── TABS LOGIN ───────────────────────────────────────────────
+function trocarTab(modo) {
+    modoLogin = modo;
+    document.getElementById('tabEntrar').classList.toggle('active',   modo === 'entrar');
+    document.getElementById('tabCadastro').classList.toggle('active', modo === 'cadastro');
+    document.getElementById('btnAcao').textContent   = modo === 'entrar' ? 'Entrar' : 'Cadastrar';
+    document.getElementById('campoNome').style.display     = modo === 'cadastro' ? 'block' : 'none';
+    document.getElementById('campoConfirma').style.display = modo === 'cadastro' ? 'block' : 'none';
+    document.getElementById('linkReset').style.display     = modo === 'entrar'   ? 'block' : 'none';
+    document.getElementById('loginErr').style.display = 'none';
+}
+
+// ─── AÇÃO DE LOGIN / CADASTRO ────────────────────────────────
+async function acaoLogin() {
+    const email  = document.getElementById('loginEmail').value.trim();
+    const senha  = document.getElementById('loginSenha').value;
+    const errEl  = document.getElementById('loginErr');
+    const btn    = document.getElementById('btnAcao');
+
+    errEl.style.display = 'none';
+    if (!email || !senha) { mostrarErrLogin('Preencha e-mail e senha.'); return; }
+
+    if (modoLogin === 'cadastro') {
+        const confirma = document.getElementById('loginConfirma').value;
+        if (senha !== confirma) { mostrarErrLogin('As senhas não coincidem.'); return; }
+        if (senha.length < 6)   { mostrarErrLogin('A senha deve ter ao menos 6 caracteres.'); return; }
+    }
+
+    btn.disabled = true;
+    btn.textContent = '⏳ Aguarde...';
+
+    try {
+        if (modoLogin === 'entrar') {
+            await window.AUTH.authEntrar(email, senha);
+        } else {
+            await window.AUTH.authCadastrar(email, senha);
+        }
+        // onAuthStateChanged cuida da transição de tela
+    } catch(e) {
+        mostrarErrLogin(traduzirErroAuth(e.code));
+        btn.disabled = false;
+        btn.textContent = modoLogin === 'entrar' ? 'Entrar' : 'Cadastrar';
+    }
+}
+
+function mostrarErrLogin(msg) {
+    const el = document.getElementById('loginErr');
+    el.textContent = '⚠️ ' + msg;
+    el.style.display = 'block';
+}
+
+function traduzirErroAuth(code) {
+    const erros = {
+        'auth/user-not-found':      'E-mail não cadastrado.',
+        'auth/wrong-password':      'Senha incorreta.',
+        'auth/invalid-email':       'E-mail inválido.',
+        'auth/email-already-in-use':'E-mail já cadastrado. Faça login.',
+        'auth/weak-password':       'Senha muito fraca (mínimo 6 caracteres).',
+        'auth/too-many-requests':   'Muitas tentativas. Tente novamente mais tarde.',
+        'auth/invalid-credential':  'E-mail ou senha incorretos.',
+        'auth/network-request-failed': 'Sem conexão. Verifique sua internet.',
+    };
+    return erros[code] || 'Erro: ' + code;
+}
+
+async function resetSenha() {
+    const email = document.getElementById('loginEmail').value.trim();
+    if (!email) { mostrarErrLogin('Digite seu e-mail para recuperar a senha.'); return; }
+    try {
+        await window.AUTH.authResetSenha(email);
+        showStatus('📧 E-mail de recuperação enviado!', 'ok', 5000);
+    } catch(e) {
+        mostrarErrLogin(traduzirErroAuth(e.code));
+    }
+}
+
+async function fazerLogout() {
+    if (!confirm('Sair da conta?')) return;
+    await window.AUTH.authSair();
+    // onAuthStateChanged chama mostrarLogin()
+}
+
+// Tecla Enter nos campos de login
+document.addEventListener('keydown', e => {
+    if (e.key === 'Enter' && document.getElementById('telaLogin').style.display !== 'none') {
+        acaoLogin();
+    }
+});
+
+// ─── NOMES ───────────────────────────────────────────────────
+function carregarNomes() {
+    const nomes = window._nomesCache ? window._nomesCache() : { fazenda1: 'Fazenda 1', fazenda2: 'Fazenda 2' };
+    document.getElementById('nomeFazenda1').value = nomes['fazenda1'] || 'Fazenda 1';
+    document.getElementById('nomeFazenda2').value = nomes['fazenda2'] || 'Fazenda 2';
+    document.getElementById('btnFarm1').textContent = nomes['fazenda1'] || 'Fazenda 1';
+    document.getElementById('btnFarm2').textContent = nomes['fazenda2'] || 'Fazenda 2';
+    document.getElementById('labelUnidade').textContent = nomes[currentFarm] || currentFarm;
+}
+
+async function salvarNome() {
+    const n1 = document.getElementById('nomeFazenda1').value || 'Fazenda 1';
+    const n2 = document.getElementById('nomeFazenda2').value || 'Fazenda 2';
+    try {
+        await window.FS.fsSetNomes({ fazenda1: n1, fazenda2: n2 });
+        carregarNomes();
+        atualizarUI();
+        showStatus('✅ Nomes salvos!', 'ok');
+    } catch(e) {
+        showStatus('❌ Erro ao salvar nomes.', 'err');
+    }
+}
+
+function mudarFazenda(f) {
+    currentFarm = f;
+    document.getElementById('btnFarm1').classList.toggle('active', f === 'fazenda1');
+    document.getElementById('btnFarm2').classList.toggle('active', f === 'fazenda2');
+    const nomes = window._nomesCache ? window._nomesCache() : {};
+    document.getElementById('labelUnidade').textContent = nomes[f] || f;
+    atualizarUI();
+}
+
+// ─── REGISTROS ──────────────────────────────────────────────
+async function lancar() {
+    const dataInput = document.getElementById('dataChuva').value;
+    const valor = parseFloat(document.getElementById('valorChuva').value);
+    if (!dataInput || isNaN(valor) || valor < 0) {
+        showStatus('⚠️ Preencha data e valor corretamente.', 'err'); return;
+    }
+
+    const regs = window._registrosCache();
+    const existe = regs.find(r => r.fazenda === currentFarm && r.data === dataInput);
+    if (existe) { showStatus('⚠️ Data já registrada para esta unidade!', 'err'); return; }
+
+    const btn = document.getElementById('btnSalvar');
+    btn.disabled = true;
+    btn.innerHTML = '<span class="loading-spinner"></span> Salvando...';
+
+    try {
+        await window.FS.fsAddRegistro({ fazenda: currentFarm, data: dataInput, valor_mm: valor });
+        document.getElementById('valorChuva').value = '';
+        showStatus('✅ Registro salvo!', 'ok');
+        atualizarUI();
+    } catch(e) {
+        showStatus('❌ Erro ao salvar: ' + e.message, 'err');
+    } finally {
+        btn.disabled = false;
+        btn.innerHTML = '💾 SALVAR REGISTRO';
+    }
+}
+
+async function deletarRegistro(docId) {
+    if (!confirm('Remover este registro?')) return;
+    try {
+        await window.FS.fsDeleteRegistro(docId);
+        showStatus('🗑️ Removido.', 'info');
+        atualizarUI();
+    } catch(e) {
+        showStatus('❌ Erro ao remover.', 'err');
+    }
+}
+
+// ─── ATUALIZAR UI ────────────────────────────────────────────
+function atualizarUI() {
+    const anoSel = parseInt(document.getElementById('anoSelect').value) || new Date().getFullYear();
+    const hoje   = new Date();
+    const mAtual = hoje.getMonth();
+    const aAtual = hoje.getFullYear();
+    const nomes  = window._nomesCache ? window._nomesCache() : {};
+
+    const todosRegs = window._registrosCache();
+    const regsAno   = todosRegs.filter(r => r.data && r.data.startsWith(String(anoSel)));
+    const dadosF1   = regsAno.filter(r => r.fazenda === 'fazenda1');
+    const dadosF2   = regsAno.filter(r => r.fazenda === 'fazenda2');
+    const dadosAtuais = currentFarm === 'fazenda1' ? dadosF1 : dadosF2;
+
+    // ── Registros recentes ──
+    const recentes = [...dadosAtuais].sort((a, b) => b.data.localeCompare(a.data)).slice(0, 15);
+    const lista = document.getElementById('registrosLista');
+    lista.innerHTML = recentes.length === 0
+        ? '<p style="color:#555;font-size:13px;text-align:center;margin:20px 0;">Nenhum registro ainda.</p>'
+        : recentes.map(r => `
+            <div class="reg-item">
+                <span class="reg-data">${fmtData(r.data)}</span>
+                <span class="reg-val">${parseFloat(r.valor_mm).toFixed(1)} mm</span>
+                <button class="del-btn" onclick="deletarRegistro('${r._docId}')">✕</button>
+            </div>`).join('');
+
+    // ── Diário ──
+    const diasNoMes = new Date(aAtual, mAtual + 1, 0).getDate();
+    const prefixMes = `${aAtual}-${pad(mAtual + 1)}-`;
+    const regsMes   = todosRegs.filter(r => r.fazenda === currentFarm && r.data && r.data.startsWith(prefixMes));
+    const valDias   = Array(diasNoMes).fill(0);
+    let totalM = 0, picoM = 0;
+    regsMes.forEach(d => {
+        const idx = parseInt(d.data.split('-')[2]) - 1;
+        valDias[idx] += parseFloat(d.valor_mm);
+        totalM += parseFloat(d.valor_mm);
+        if (parseFloat(d.valor_mm) > picoM) picoM = parseFloat(d.valor_mm);
+    });
+    document.getElementById('totalMes').innerText = totalM.toFixed(1) + ' mm';
+    document.getElementById('picoMes').innerText  = picoM.toFixed(1)  + ' mm';
+    renderChart('chartDiario', 'bar', Array.from({length: diasNoMes}, (_, i) => i + 1),
+        [{label: 'mm', data: valDias, backgroundColor: '#66bb6a'}]);
+
+    // ── Mensal ──
+    const meses  = ['Jan','Fev','Mar','Abr','Mai','Jun','Jul','Ago','Set','Out','Nov','Dez'];
+    const pAnual = lista2 => {
+        const m = Array(12).fill(0); let tot = 0;
+        lista2.forEach(d => { const i = parseInt(d.data.split('-')[1]) - 1; m[i] += parseFloat(d.valor_mm); tot += parseFloat(d.valor_mm); });
+        return { m, tot };
+    };
+    const rF1 = pAnual(dadosF1), rF2 = pAnual(dadosF2);
+    const mMensal = currentFarm === 'fazenda1' ? rF1.m : rF2.m;
+
+    const mesesComDado = mMensal.map((v, i) => ({v, i})).filter(x => x.v > 0);
+    if (mesesComDado.length > 0) {
+        const menor = mesesComDado.reduce((a, b) => a.v <= b.v ? a : b);
+        const maior = mesesComDado.reduce((a, b) => a.v >= b.v ? a : b);
+        document.getElementById('menorMesNome').innerText = meses[menor.i];
+        document.getElementById('menorMesVal').innerText  = menor.v.toFixed(1) + ' mm';
+        document.getElementById('maiorMesNome').innerText = meses[maior.i];
+        document.getElementById('maiorMesVal').innerText  = maior.v.toFixed(1) + ' mm';
+        const diasComChuva = dadosAtuais.length;
+        const totalAnual   = mMensal.reduce((a, b) => a + b, 0);
+        document.getElementById('diasChuva').innerText   = diasComChuva;
+        document.getElementById('mediaDiaria').innerText = diasComChuva > 0 ? (totalAnual / diasComChuva).toFixed(1) + ' mm' : '0 mm';
+        const cores = mMensal.map((v, i) => {
+            if (v === 0) return 'transparent';
+            if (i === menor.i) return '#64b5f6';
+            if (i === maior.i) return '#ff7043';
+            return '#2e7d32';
+        });
+        renderChart('chartMensal', 'bar', meses, [{label: 'Total mm', data: mMensal, backgroundColor: cores}]);
+    } else {
+        document.getElementById('menorMesNome').innerText = '—';
+        document.getElementById('menorMesVal').innerText  = '0 mm';
+        document.getElementById('maiorMesNome').innerText = '—';
+        document.getElementById('maiorMesVal').innerText  = '0 mm';
+        document.getElementById('diasChuva').innerText    = '0';
+        document.getElementById('mediaDiaria').innerText  = '0 mm';
+        renderChart('chartMensal', 'bar', meses, [{label: 'Total mm', data: mMensal, backgroundColor: '#2e7d32'}]);
+    }
+
+    // ── Comparativo ──
+    const nF1 = nomes['fazenda1'] || 'Fazenda 1';
+    const nF2 = nomes['fazenda2'] || 'Fazenda 2';
+    renderChart('chartComp', 'line', meses, [
+        {label: `${nF1}: ${rF1.tot.toFixed(0)} mm`, data: rF1.m, borderColor: '#66bb6a', backgroundColor: '#66bb6a33', tension: 0.3, fill: true},
+        {label: `${nF2}: ${rF2.tot.toFixed(0)} mm`, data: rF2.m, borderColor: '#b3e4ff', backgroundColor: '#b3e4ff33', tension: 0.3, fill: true}
+    ]);
+}
+
+// ─── HELPERS ─────────────────────────────────────────────────
+const fmtData = iso => { const [y,m,d] = iso.split('-'); return `${d}/${m}/${y}`; };
+const pad = n => String(n).padStart(2, '0');
+
+function renderChart(id, type, labels, datasets) {
+    if (charts[id]) charts[id].destroy();
+    charts[id] = new Chart(document.getElementById(id).getContext('2d'), {
+        type, data: { labels, datasets },
+        options: {
+            responsive: true, maintainAspectRatio: false,
+            layout: { padding: { top: 25 } },
+            plugins: {
+                legend: { display: id === 'chartComp', labels: { color: '#fff', font: {weight: 'bold'} } },
+                datalabels: { anchor: 'end', align: 'top', color: '#fff', font: {weight: 'bold', size: 10}, formatter: v => v > 0 ? v.toFixed(0) : '', clip: false }
+            },
+            scales: {
+                y: { grace: '10%', ticks: { color: '#888' }, grid: { color: '#1a331a' } },
+                x: { ticks: { color: '#888' }, grid: { display: false } }
+            }
+        }
+    });
+}
+
+function povoarAnos() {
+    const s = document.getElementById('anoSelect'); s.innerHTML = '';
+    const a = new Date().getFullYear();
+    for (let i = a; i >= a - 3; i--) {
+        const o = document.createElement('option'); o.value = i; o.text = 'Dados de ' + i; s.appendChild(o);
+    }
+}
+
+// ─── EXPORTAR / IMPORTAR ─────────────────────────────────────
+function exportarDados() {
+    const regs  = window._registrosCache();
+    const nomes = window._nomesCache ? window._nomesCache() : {};
+    const backup = {
+        versao: 2, fonte: 'firebase', nomes,
+        f1: regs.filter(r => r.fazenda === 'fazenda1').map(r => ({data: r.data, valor: r.valor_mm})),
+        f2: regs.filter(r => r.fazenda === 'fazenda2').map(r => ({data: r.data, valor: r.valor_mm}))
+    };
+    const blob = new Blob([JSON.stringify(backup, null, 2)], {type: 'application/json'});
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = `pluviometro_backup_${new Date().toISOString().slice(0,10)}.json`;
+    a.click();
+    showStatus('✅ Exportado!', 'ok');
+}
+
+async function importarDados(file) {
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = async e => {
+        try {
+            const bk = JSON.parse(e.target.result);
+            const novos = [];
+            (bk.f1 || []).forEach(r => novos.push({fazenda: 'fazenda1', data: r.data, valor_mm: parseFloat(r.valor)}));
+            (bk.f2 || []).forEach(r => novos.push({fazenda: 'fazenda2', data: r.data, valor_mm: parseFloat(r.valor)}));
+            const existentes = window._registrosCache();
+            const chaves     = new Set(existentes.map(r => r.fazenda + '|' + r.data));
+            const filtrados  = novos.filter(r => !chaves.has(r.fazenda + '|' + r.data));
+            showStatus(`⏳ Importando ${filtrados.length} registros...`, 'info', 99999);
+            for (const reg of filtrados) await window.FS.fsAddRegistro(reg);
+            if (bk.nomes) await window.FS.fsSetNomes(bk.nomes);
+            carregarNomes();
+            atualizarUI();
+            showStatus(`✅ ${filtrados.length} registros importados!`, 'ok');
+        } catch(err) {
+            showStatus('❌ Arquivo inválido ou erro no Firebase.', 'err');
+            console.error(err);
+        }
+    };
+    reader.readAsText(file);
+    document.getElementById('fileIn').value = '';
+}
+
+async function limparTudo() {
+    if (!confirm('Apagar TODOS os seus registros? Esta ação não pode ser desfeita.')) return;
+    const regs = window._registrosCache();
+    showStatus(`⏳ Removendo ${regs.length} registros...`, 'info', 99999);
+    for (const r of regs) await window.FS.fsDeleteRegistro(r._docId);
+    atualizarUI();
+    showStatus('🗑️ Todos os registros removidos.', 'info');
+}
+
+// Listener nomes
+document.addEventListener('DOMContentLoaded', () => {
+    ['nomeFazenda1', 'nomeFazenda2'].forEach(id => {
+        const el = document.getElementById(id);
+        if (el) el.addEventListener('change', salvarNome);
+    });
+});
+</script>
+
+</body>
+</html>
